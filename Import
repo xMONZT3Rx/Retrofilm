@@ -1,0 +1,507 @@
+package com.retrofilm.app
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.ContentValues
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.media.*
+import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.*
+import androidx.camera.view.PreviewView
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.media3.common.MediaItem
+import androidx.media3.transformer.*
+import androidx.window.layout.FoldingFeature
+import androidx.window.layout.WindowInfoTracker
+import kotlinx.coroutines.delay
+import java.io.File
+import java.nio.ByteBuffer
+import java.text.SimpleDateFormat
+import java.util.*
+import kotlin.random.Random
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MaterialTheme {
+                RetrofilmApp()
+            }
+        }
+    }
+}
+
+@Composable
+fun RetrofilmApp() {
+    val context = LocalContext.current
+    var hasPermissions by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { perms ->
+        hasPermissions = perms[Manifest.permission.CAMERA] == true &&
+                perms[Manifest.permission.RECORD_AUDIO] == true
+    }
+
+    LaunchedEffect(Unit) {
+        if (!hasPermissions) {
+            launcher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
+        }
+    }
+
+    if (hasPermissions) {
+        CamcorderScreen()
+    } else {
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color(0xFF141416)),
+            contentAlignment = Alignment.Center
+        ) {
+            Button(onClick = {
+                launcher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
+            }) {
+                Text("Grant Camera & Mic Access for Retrofilm", fontFamily = FontFamily.Monospace)
+            }
+        }
+    }
+}
+
+@Composable
+fun CamcorderScreen() {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    var isRecording by remember { mutableStateOf(false) }
+    var isExporting by remember { mutableStateOf(false) }
+    var tapeCounter by remember { mutableIntStateOf(0) }
+    val recordedSegments = remember { mutableStateListOf<File>() }
+
+    val controller = remember { CamcorderController(context, lifecycleOwner) }
+    val stitcher = remember { CassetteStitcher(context) }
+
+    LaunchedEffect(Unit) {
+        controller.bindCamera()
+    }
+
+    LaunchedEffect(isRecording) {
+        while (isRecording) {
+            delay(1000L)
+            tapeCounter++
+        }
+    }
+
+    val triggerEject = {
+        if (recordedSegments.isNotEmpty() && !isRecording && !isExporting) {
+            isExporting = true
+            val outFile = File(context.cacheDir, "Retrofilm_Master_${System.currentTimeMillis()}.mp4")
+            stitcher.exportCassetteWithSplices(
+                segmentFiles = recordedSegments.toList(),
+                outputFile = outFile,
+                onComplete = { finalFile ->
+                    saveToGallery(context, finalFile)
+                    recordedSegments.forEach { it.delete() }
+                    recordedSegments.clear()
+                    tapeCounter = 0
+                    isExporting = false
+                    Toast.makeText(context, "Tape Ejected & Saved to Google Photos!", Toast.LENGTH_LONG).show()
+                },
+                onError = { err ->
+                    isExporting = false
+                    Toast.makeText(context, "Stitch Error: ${err.message}", Toast.LENGTH_LONG).show()
+                }
+            )
+        }
+    }
+
+    CamcorderFoldContainer(
+        isRecording = isRecording,
+        isExporting = isExporting,
+        segmentCount = recordedSegments.size,
+        tapeCounter = tapeCounter,
+        onRecordToggle = { shouldRecord ->
+            if (isExporting) return@CamcorderFoldContainer
+            if (shouldRecord) {
+                controller.startSegment { savedFile ->
+                    recordedSegments.add(savedFile)
+                }
+                isRecording = true
+            } else {
+                controller.stopSegment()
+                isRecording = false
+            }
+        },
+        onEjectTape = triggerEject,
+        onZoomChanged = { controller.setZoom(it) },
+        cameraPreview = {
+            AndroidView(factory = { controller.previewView }, modifier = Modifier.fillMaxSize())
+        }
+    )
+}
+
+@Composable
+fun CamcorderFoldContainer(
+    isRecording: Boolean,
+    isExporting: Boolean,
+    segmentCount: Int,
+    tapeCounter: Int,
+    onRecordToggle: (Boolean) -> Unit,
+    onEjectTape: () -> Unit,
+    onZoomChanged: (Float) -> Unit,
+    cameraPreview: @Composable () -> Unit
+) {
+    val context = LocalContext.current
+    var isTabletopMode by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        WindowInfoTracker.getOrCreate(context)
+            .windowLayoutInfo(context as ComponentActivity)
+            .collect { layoutInfo ->
+                val fold = layoutInfo.displayFeatures.filterIsInstance<FoldingFeature>().firstOrNull()
+                isTabletopMode = fold?.state == FoldingFeature.State.HALF_OPENED &&
+                        fold.orientation == FoldingFeature.Orientation.HORIZONTAL
+            }
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(Color(0xFF141416))) {
+        if (isTabletopMode) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    CrtViewfinderPanel(isRecording, isExporting, segmentCount, cameraPreview)
+                }
+                Spacer(modifier = Modifier.fillMaxWidth().height(8.dp).background(Color.Black))
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    CamcorderDeckPanel(
+                        isRecording = isRecording,
+                        segmentCount = segmentCount,
+                        tapeCounter = tapeCounter,
+                        onRecordToggle = onRecordToggle,
+                        onEjectTape = onEjectTape,
+                        onZoomChanged = onZoomChanged
+                    )
+                }
+            }
+        } else {
+            // Unfolded / Outer Screen Layout
+            Column(modifier = Modifier.fillMaxSize()) {
+                Box(modifier = Modifier.weight(1.3f).fillMaxWidth()) {
+                    CrtViewfinderPanel(isRecording, isExporting, segmentCount, cameraPreview)
+                }
+                Box(modifier = Modifier.weight(0.7f).fillMaxWidth()) {
+                    CamcorderDeckPanel(
+                        isRecording = isRecording,
+                        segmentCount = segmentCount,
+                        tapeCounter = tapeCounter,
+                        onRecordToggle = onRecordToggle,
+                        onEjectTape = onEjectTape,
+                        onZoomChanged = onZoomChanged
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CrtViewfinderPanel(
+    isRecording: Boolean,
+    isExporting: Boolean,
+    segmentCount: Int,
+    cameraPreview: @Composable () -> Unit
+) {
+    var currentTime by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) {
+        val sdf = SimpleDateFormat("MMM dd yyyy\nhh:mm:ss a", Locale.US)
+        while (true) {
+            currentTime = sdf.format(Date()).uppercase()
+            delay(1000L)
+        }
+    }
+
+    val infiniteTransition = rememberInfiniteTransition(label = "blink")
+    val recAlpha by infiniteTransition.animateFloat(
+        initialValue = 1f, targetValue = 0f,
+        animationSpec = infiniteRepeatable(tween(600, easing = LinearEasing), RepeatMode.Reverse),
+        label = "recAlpha"
+    )
+
+    Box(modifier = Modifier.fillMaxSize().padding(12.dp), contentAlignment = Alignment.Center) {
+        Box(
+            modifier = Modifier
+                .aspectRatio(4f / 3f)
+                .clip(RoundedCornerShape(12.dp))
+                .border(2.dp, Color(0xFF2C2C2E), RoundedCornerShape(12.dp))
+                .background(Color.Black)
+        ) {
+            cameraPreview()
+
+            Column(
+                modifier = Modifier.fillMaxSize().padding(16.dp),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("SP [CLIPS:$segmentCount]", color = Color(0xFFE2E2E2), fontFamily = FontFamily.Monospace, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+
+                    if (isExporting) {
+                        Text("EJECTING TAPE...", color = Color(0xFF30D158), fontFamily = FontFamily.Monospace, fontSize = 14.sp, fontWeight = FontWeight.Black)
+                    } else if (isRecording) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(modifier = Modifier.size(10.dp).background(Color.Red.copy(alpha = recAlpha), CircleShape))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("REC", color = Color.Red.copy(alpha = recAlpha), fontFamily = FontFamily.Monospace, fontSize = 14.sp, fontWeight = FontWeight.Black)
+                        }
+                    } else {
+                        Text("STBY", color = Color(0xFFFFD60A), fontFamily = FontFamily.Monospace, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                Text(
+                    text = currentTime,
+                    color = Color(0xFFF3F3F3),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 13.sp,
+                    lineHeight = 16.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun CamcorderDeckPanel(
+    isRecording: Boolean,
+    segmentCount: Int,
+    tapeCounter: Int,
+    onRecordToggle: (Boolean) -> Unit,
+    onEjectTape: () -> Unit,
+    onZoomChanged: (Float) -> Unit
+) {
+    Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF1E1F22)) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.SpaceEvenly
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("RETROFILM HI-8", color = Color(0xFF8E8E93), fontSize = 12.sp, fontFamily = FontFamily.Monospace, letterSpacing = 2.sp)
+
+                // Eject & Stitch Button
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(if (segmentCount > 0 && !isRecording) Color(0xFF3A3A3C) else Color(0xFF141416))
+                        .border(1.dp, Color(0xFF636366), RoundedCornerShape(6.dp))
+                        .clickable(enabled = segmentCount > 0 && !isRecording) { onEjectTape() }
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = "⏏ EJECT & STITCH ($segmentCount)",
+                        color = if (segmentCount > 0 && !isRecording) Color.White else Color(0xFF48484A),
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                // Tape Counter
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(Color(0xFF0F0F10))
+                        .border(1.dp, Color(0xFF3A3A3C), RoundedCornerShape(4.dp))
+                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                ) {
+                    Text(String.format("%04d", tapeCounter), color = Color(0xFFFF9F0A), fontFamily = FontFamily.Monospace, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            // Servo Optical Zoom Slider
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("W", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Spacer(modifier = Modifier.width(12.dp))
+                var sliderPosition by remember { mutableFloatStateOf(1f) }
+                Slider(
+                    value = sliderPosition,
+                    onValueChange = {
+                        sliderPosition = it
+                        onZoomChanged(it)
+                    },
+                    valueRange = 1f..5f,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                Text("T", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            }
+
+            // Tactile Record Trigger
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                RecordButton(isRecording = isRecording, onToggle = onRecordToggle)
+            }
+        }
+    }
+}
+
+@Composable
+fun RecordButton(isRecording: Boolean, onToggle: (Boolean) -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(72.dp)
+            .shadow(8.dp, CircleShape)
+            .clip(CircleShape)
+            .background(
+                Brush.radialGradient(
+                    colors = if (isRecording) listOf(Color(0xFFFF453A), Color(0xFFB00020))
+                    else listOf(Color(0xFFD32F2F), Color(0xFF8B0000))
+                )
+            )
+            .border(3.dp, Color(0xFF48484A), CircleShape)
+            .pointerInput(isRecording) {
+                detectTapGestures(onTap = { onToggle(!isRecording) })
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            modifier = Modifier
+                .size(if (isRecording) 24.dp else 28.dp)
+                .background(Color.White, if (isRecording) RoundedCornerShape(4.dp) else CircleShape)
+        )
+    }
+}
+
+class CamcorderController(private val context: Context, private val lifecycleOwner: LifecycleOwner) {
+    private var camera: Camera? = null
+    private var videoCapture: VideoCapture<Recorder>? = null
+    private var activeRecording: Recording? = null
+
+    val previewView = PreviewView(context).apply {
+        scaleType = PreviewView.ScaleType.FILL_CENTER
+        implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+    }
+
+    fun bindCamera() {
+        val future = ProcessCameraProvider.getInstance(context)
+        future.addListener({
+            val provider = future.get()
+            val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+            val recorder = Recorder.Builder()
+                .setQualitySelector(QualitySelector.from(Quality.SD))
+                .setTargetVideoEncodingBitRate(3_500_000)
+                .build()
+            videoCapture = VideoCapture.withOutput(recorder)
+            try {
+                provider.unbindAll()
+                camera = provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, videoCapture)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }, ContextCompat.getMainExecutor(context))
+    }
+
+    fun setZoom(zoom: Float) {
+        val norm = ((zoom - 1f) / 4f).coerceIn(0f, 1f)
+        camera?.cameraControl?.setLinearZoom(norm)
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startSegment(onSaved: (File) -> Unit) {
+        val capture = videoCapture ?: return
+        val file = File(context.cacheDir, "seg_${System.currentTimeMillis()}.mp4")
+        val opts = FileOutputOptions.Builder(file).build()
+        activeRecording = capture.output
+            .prepareRecording(context, opts)
+            .withAudioEnabled()
+            .start(ContextCompat.getMainExecutor(context)) { event ->
+                if (event is VideoRecordEvent.Finalize && !event.hasError()) {
+                    onSaved(file)
+                }
+            }
+    }
+
+    fun stopSegment() {
+        activeRecording?.stop()
+        activeRecording = null
+    }
+}
+
+object GlitchAssetGenerator {
+    private const val WIDTH = 720
+    private const val HEIGHT = 480
+    private const val FPS = 30
+    private const val FRAME_COUNT = 3
+    private const val SAMPLE_RATE = 44100
+
+    private class SamplePacket(val data: ByteBuffer, val info: MediaCodec.BufferInfo)
+
+    fun getOrGenerateGlitchFile(context: Context): File {
+        val file = File(context.filesDir, "retrofilm_splice_glitch.mp4")
+        if (file.exists() && file.length() > 0) return file
+
+        // 1. Encode 3 Video Frames into RAM buffer
+        val vFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH, HEIGHT).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, 3_500_000)
+            setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
+        val vCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        vCodec.configure(vFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val surface = vCodec.createInputSurface()
+        vCodec.start()
+
+        val paint = Paint()
+        for (i in 0 until FRAME_COUNT) {
+            val canvas = surface.lockHardwareCanvas()
+            renderGlitchFrame(canvas, paint, i)
+            surface.unlockCanvasAndPost(canvas)
+        }
+        vCodec.signalEndOfInputSt
